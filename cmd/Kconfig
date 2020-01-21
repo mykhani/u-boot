@@ -838,6 +838,11 @@ config CMD_I2C
 	help
 	  I2C support.
 
+config CMD_SERIAL
+	bool "serial"
+	help
+	  Serial support.
+
 config CMD_W1
 	depends on W1
 	default y if W1
