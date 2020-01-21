@@ -28,6 +28,7 @@
 #include <asm/omap_common.h>
 #include <asm/omap_sec_common.h>
 #include <asm/omap_mmc.h>
+#include <asm/davinci_rtc.h>
 #include <i2c.h>
 #include <miiphy.h>
 #include <cpsw.h>
@@ -38,6 +39,7 @@
 #include <environment.h>
 #include "../common/board_detect.h"
 #include "board.h"
+#include "hash-string.h"
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -76,14 +78,479 @@ void do_board_detect(void)
 	if (ti_i2c_eeprom_am_get(CONFIG_EEPROM_BUS_ADDRESS,
 				 CONFIG_EEPROM_CHIP_ADDRESS))
 		printf("ti_i2c_eeprom_init failed\n");
+
+	//hack-ish, needs to mux'ed early, in do_cape_detect was too late...
+	enable_i2c2_pin_mux();
+#ifndef CONFIG_DM_I2C
+	i2c_init(CONFIG_SYS_OMAP24_I2C_SPEED2, CONFIG_SYS_OMAP24_I2C_SLAVE2);
+#endif
 }
 #endif
+
+#define CAPE_EEPROM_ADDR0	0x54
+#define CAPE_EEPROM_ADDR1	0x55
+#define CAPE_EEPROM_ADDR2	0x56
+#define CAPE_EEPROM_ADDR3	0x57
+
+#define NOT_POP		0x0
+#define PINS_TAKEN	0x0
+
+#define UNK_BASE_DTB	0x0
+#define BB_BASE_DTB	0x1
+#define BBB_BASE_DTB	0x2
+#define BBGW_BASE_DTB	0x3
+#define BBBL_BASE_DTB	0x4
+#define BBE_BASE_DTB	0x5
+
+#define BBB_EMMC	0x1
+
+#define BBB_TDA998X_AUDIO	0x1
+#define BBB_TDA998X_NAUDIO	0x2
+#define BBB_ADV7511_AUDIO	0x3
+#define BBB_ADV7511_NAUDIO	0x4
+
+#define BBB_ADC		0x1
+
+#define BBBW_WL1835	0x1
+#define BBGW_WL1835	0x2
+#define BBGG_WL1835	0x3
+
+#define CAPE_UNIVERSAL	0x0
+#define CAPE_UNIVERSAL_BBB	0x01
+#define CAPE_UNIVERSAL_BBG	0x02
+#define CAPE_UNIVERSAL_BBGW	0x03
+
+#define M_BBG1	0x01
+#define M_OS00	0x02
+#define M_BBGG	0x03
+
+static int probe_cape_eeprom(struct am335x_cape_eeprom_id *cape_header)
+{
+	unsigned char addr;
+	/* /lib/firmware/BB-CAPE-DISP-CT4-00A0.dtbo */
+	/* 14 + 16 + 1 + 4 + 5 = 40 */
+	char cape_overlay[40];
+	char process_cape_part_number[16];
+	char end_part_number;
+	char cape_overlay_pass_to_kernel[18];
+
+	//Don't forget about the BeagleBone Classic (White)
+	char base_dtb=UNK_BASE_DTB;
+	char virtual_emmc=NOT_POP;
+	char virtual_video=NOT_POP;
+	char virtual_audio=NOT_POP;
+	char virtual_wireless=NOT_POP;
+	char cape_universal=CAPE_UNIVERSAL;
+	char virtual_adc=NOT_POP;
+	char model=NOT_POP;
+
+	char *name = NULL;
+
+	if (board_is_bone_lt()) {
+		puts("BeagleBone Black:\n");
+		base_dtb=BBB_BASE_DTB;
+		virtual_emmc=BBB_EMMC;
+		virtual_video=BBB_TDA998X_AUDIO;
+		virtual_audio=BBB_TDA998X_AUDIO;
+		virtual_wireless=NOT_POP;
+		virtual_adc=BBB_ADC;
+		cape_universal=CAPE_UNIVERSAL_BBB;
+		name = "A335BNLT";
+
+		if (!strncmp(board_ti_get_rev(), "BLA", 3)) {
+			puts("Model: BeagleBoard.org BeagleBone Blue:\n");
+			/* Special case */
+			base_dtb=BBBL_BASE_DTB;
+			virtual_emmc=NOT_POP;
+			virtual_video=NOT_POP;
+			virtual_audio=NOT_POP;
+			virtual_wireless=NOT_POP;
+			virtual_adc=BBB_ADC;
+			cape_universal=CAPE_UNIVERSAL;
+			name = "BBBL";
+		}
+		if (!strncmp(board_ti_get_rev(), "BW", 2)) {
+			puts("Model: BeagleBoard.org BeagleBone Black Wireless:\n");
+			virtual_wireless=BBBW_WL1835;
+			name = "BBBW";
+		}
+		if (!strncmp(board_ti_get_rev(), "BBG", 3)) {
+			/* catches again in board_is_bbg1() */
+			//puts("Model: SeeedStudio BeagleBone Green:\n");
+			virtual_video=NOT_POP;
+			virtual_audio=NOT_POP;
+			cape_universal=CAPE_UNIVERSAL_BBG;
+			name = "BBG1";
+			model=M_BBG1;
+		}
+		if (!strncmp(board_ti_get_rev(), "GW1", 3)) {
+			puts("Model: SeeedStudio BeagleBone Green Wireless:\n");
+			base_dtb=BBGW_BASE_DTB;
+			virtual_video=NOT_POP;
+			virtual_audio=NOT_POP;
+			virtual_wireless=BBGW_WL1835;
+			cape_universal=CAPE_UNIVERSAL_BBGW;
+		}
+		if (!strncmp(board_ti_get_rev(), "GG1", 3)) {
+			puts("Model: SeeedStudio BeagleBone Green Gateway:\n");
+			virtual_video=NOT_POP;
+			virtual_audio=NOT_POP;
+			virtual_wireless=BBGG_WL1835;
+			model=M_BBGG;
+		}
+		if (!strncmp(board_ti_get_rev(), "AIA", 3)) {
+			puts("Model: Arrow BeagleBone Black Industrial:\n");
+			virtual_video=BBB_ADV7511_AUDIO;
+			virtual_audio=BBB_ADV7511_AUDIO;
+			cape_universal=CAPE_UNIVERSAL;
+		}
+		if (!strncmp(board_ti_get_rev(), "EIA", 3)) {
+			puts("Model: Element14 BeagleBone Black Industrial:\n");
+		}
+		if (!strncmp(board_ti_get_rev(), "SE", 2)) {
+			puts("Model: SanCloud BeagleBone Enhanced:\n");
+			base_dtb=BBE_BASE_DTB;
+			cape_universal=CAPE_UNIVERSAL_BBB;
+			name = "BBEN";
+		}
+		if (!strncmp(board_ti_get_rev(), "ME0", 3)) {
+			puts("Model: MENTOREL BeagleBone uSomIQ:\n");
+			virtual_video=NOT_POP;
+			virtual_audio=NOT_POP;
+			cape_universal=CAPE_UNIVERSAL_BBG;
+		}
+		if (!strncmp(board_ti_get_rev(), "NAD", 3)) {
+			puts("Model: Neuromeka BeagleBone Air:\n");
+			cape_universal=CAPE_UNIVERSAL;
+		}
+		if (!strncmp(board_ti_get_rev(), "OS0", 3)) {
+			puts("Model: Octavo Systems OSD3358-SM-RED:\n");
+			name = "OS00";
+			cape_universal=NOT_POP;
+			model=M_OS00;
+		}
+	}
+
+	if (board_is_bone()) {
+		puts("Model: BeagleBone:\n");
+		base_dtb=BB_BASE_DTB;
+		virtual_emmc=NOT_POP;
+		virtual_video=NOT_POP;
+		virtual_audio=NOT_POP;
+		virtual_wireless=NOT_POP;
+		virtual_adc=BBB_ADC;
+		cape_universal=CAPE_UNIVERSAL_BBB;
+		name = "A335BONE";
+	}
+
+	if (board_is_bbg1()) {
+		puts("Model: SeeedStudio BeagleBone Green:\n");
+		base_dtb=BBB_BASE_DTB;
+		virtual_emmc=BBB_EMMC;
+		virtual_video=NOT_POP;
+		virtual_audio=NOT_POP;
+		virtual_wireless=NOT_POP;
+		virtual_adc=BBB_ADC;
+		cape_universal=CAPE_UNIVERSAL_BBG;
+		name = "BBG1";
+		model=M_BBG1;
+	}
+
+	set_board_info_env(name);
+
+	i2c_set_bus_num(2);
+	strlcpy(cape_overlay_pass_to_kernel, "", 1);
+
+	for ( addr = CAPE_EEPROM_ADDR0; addr <= CAPE_EEPROM_ADDR3; addr++ ) {
+		if (i2c_probe(addr)) {
+			printf("BeagleBone: cape eeprom: i2c_probe: 0x%x:\n", addr);
+		} else {
+			/* read the eeprom using i2c */
+			if (i2c_read(addr, 0, 2, (uchar *)cape_header,
+				     sizeof(struct am335x_cape_eeprom_id))) {
+				puts("BeagleBone: cape eeprom: Could not read the EEPROM; something fundamentally"
+					" wrong on the I2C bus.\n");
+				return -EIO;
+			}
+
+			if (cape_header->header == 0xEE3355AA) {
+				strlcpy(cape_overlay, "/lib/firmware/", 14 + 1);
+				strlcpy(cape_overlay_pass_to_kernel, "", 2);
+				strlcpy(process_cape_part_number, "...............", 16 + 1);
+
+				strlcpy(process_cape_part_number, cape_header->part_number, 16 + 1);
+				printf("debug: process_cape_part_number:[%s]\n", process_cape_part_number);
+
+				//FIXME: some capes end with '.'
+				if ( process_cape_part_number[15] == 0x2E ) {
+					puts("debug: fixup, extra . in eeprom field\n");
+					process_cape_part_number[15] = 0x00;
+					if ( process_cape_part_number[14] == 0x2E ) {
+						process_cape_part_number[14] = 0x00;
+					}
+				}
+
+				//Find ending 0x00
+				puts("debug: process_cape_part_number:[");
+				end_part_number=16;
+				for ( int i=0; i <= 16; i++ ) {
+					if ( process_cape_part_number[i] == 0x00 ) {
+						end_part_number=i;
+						i=17;
+					} else {
+						printf("%x", process_cape_part_number[i]);
+					}
+				}
+				puts("]\n");
+
+				strncat(cape_overlay, process_cape_part_number, end_part_number);
+				//printf("debug: %s\n", cape_overlay);
+
+				strncat(cape_overlay, "-", 1);
+				//printf("debug: %s\n", cape_overlay);
+
+				strncat(cape_overlay, cape_header->version, 4);
+				//printf("debug: %s\n", cape_overlay);
+
+				strncat(cape_overlay, ".dtbo", 5);
+				//printf("debug: %s\n", cape_overlay);
+
+				unsigned long cape_overlay_hash = hash_string(cape_overlay);
+
+				printf("BeagleBone: cape eeprom: i2c_probe: 0x%x: %s [0x%lx]\n", addr, cape_overlay, cape_overlay_hash);
+
+				strncat(cape_overlay_pass_to_kernel, process_cape_part_number, end_part_number);
+				strncat(cape_overlay_pass_to_kernel, ",", 1);
+
+				switch(cape_overlay_hash) {
+					case 0x3c766f: /* /lib/firmware/BB-CAPE-DISP-CT4-00A0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0x24f51cf: /* /lib/firmware/BB-BONE-CAM-VVDN-00A0.dtbo */
+						virtual_emmc=PINS_TAKEN;
+						break;
+					case 0x4b0c13f: /* /lib/firmware/NL-AB-BBCL-00B0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0x74e7bbf: /* /lib/firmware/bb-justboom-dac-00A0.dtbo */
+						virtual_audio=PINS_TAKEN;
+						break;
+					case 0x93b574f: /* /lib/firmware/BB-GREEN-HDMI-00A0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0x9dcd73f: /* /lib/firmware/BB-BONE-NH10C-01-00A0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xb1b7bbf: /* /lib/firmware/bb-justboom-amp-00A0.dtbo */
+						virtual_audio=PINS_TAKEN;
+						break;
+					//d15bb
+					case 0xd15b80f: /* /lib/firmware/DLPDLCR2000-00A0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xd4c9eff: /* /lib/firmware/bb-justboom-digi-00A0.dtbo */
+						virtual_audio=PINS_TAKEN;
+						break;
+					case 0xe05061f: /* /lib/firmware/BBORG_DISPLAY70-00A2.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xe3f55df: /* /lib/firmware/BB-BONE-NH7C-01-A0.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfc93c8f: /* /lib/firmware/BB-BONE-LCD7-01-00A3.dtbo */
+						virtual_video=PINS_TAKEN;
+						virtual_adc=PINS_TAKEN;
+						break;
+					//fe131
+					case 0xfe1313f: /* /lib/firmware/BB-BONE-4D5R-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					//fe132
+					case 0xfe1323f: /* /lib/firmware/BB-BONE-4D4R-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfe1327f: /* /lib/firmware/BB-BONE-4D4N-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfe132cf: /* /lib/firmware/BB-BONE-4D4C-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					//fe133
+					case 0xfe1337f: /* /lib/firmware/BB-BONE-4D7N-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfe133cf: /* /lib/firmware/BB-BONE-4D7C-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					//fe135
+					case 0xfe1357f: /* /lib/firmware/BB-BONE-4D5N-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfe135cf: /* /lib/firmware/BB-BONE-4D5C-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					//fe137
+					case 0xfe1373f: /* /lib/firmware/BB-BONE-4D7R-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						break;
+					case 0xfe93c1f: /* /lib/firmware/BB-BONE-LCD4-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						virtual_adc=PINS_TAKEN;
+						break;
+					case 0xfe93c2f: /* /lib/firmware/BB-BONE-LCD5-01-00A1.dtbo */
+						virtual_video=PINS_TAKEN;
+						virtual_adc=PINS_TAKEN;
+						break;
+				}
+
+				switch(addr) {
+					case CAPE_EEPROM_ADDR0:
+						env_set("uboot_overlay_addr0", cape_overlay);
+						env_set("uboot_detected_capes_addr0", cape_overlay_pass_to_kernel);
+						break;
+					case CAPE_EEPROM_ADDR1:
+						env_set("uboot_overlay_addr1", cape_overlay);
+						env_set("uboot_detected_capes_addr1", cape_overlay_pass_to_kernel);
+						break;
+					case CAPE_EEPROM_ADDR2:
+						env_set("uboot_overlay_addr2", cape_overlay);
+						env_set("uboot_detected_capes_addr2", cape_overlay_pass_to_kernel);
+						break;
+					case CAPE_EEPROM_ADDR3:
+						env_set("uboot_overlay_addr3", cape_overlay);
+						env_set("uboot_detected_capes_addr3", cape_overlay_pass_to_kernel);
+						break;
+				}
+				env_set("uboot_detected_capes", "1");
+			} else {
+				printf("BeagleBone: found invalid cape eeprom: i2c_probe: 0x%x:\n", addr);
+			}
+		}
+	}//for
+
+	switch(base_dtb) {
+		case BB_BASE_DTB:
+			env_set("uboot_base_dtb_univ", "am335x-bone-uboot-univ.dtb");
+			env_set("uboot_base_dtb", "am335x-bone.dtb");
+			env_set("uboot_try_cape_universal", "1");
+			break;
+		case BBB_BASE_DTB:
+			env_set("uboot_base_dtb_univ", "am335x-boneblack-uboot-univ.dtb");
+			env_set("uboot_base_dtb", "am335x-boneblack-uboot.dtb");
+			env_set("uboot_try_cape_universal", "1");
+			break;
+		case BBGW_BASE_DTB:
+			//gpio-hogs and cape-universal dont mesh very well on bootup...
+			env_set("uboot_base_dtb_univ", "am335x-bonegreen-wireless-uboot-univ.dtb");
+			env_set("uboot_base_dtb", "am335x-boneblack-uboot.dtb");
+			env_set("uboot_try_cape_universal", "1");
+			break;
+		case BBE_BASE_DTB:
+			env_set("uboot_base_dtb_univ", "am335x-sancloud-bbe-uboot-univ.dtb");
+			env_set("uboot_base_dtb", "am335x-sancloud-bbe-uboot.dtb");
+			env_set("uboot_try_cape_universal", "1");
+			break;
+		case BBBL_BASE_DTB:
+			env_set("uboot_base_dtb_univ", "am335x-boneblue.dtb");
+			break;
+	}
+
+	if (virtual_emmc == BBB_EMMC) {
+		env_set("uboot_emmc", "/lib/firmware/BB-BONE-eMMC1-01-00A0.dtbo");
+	}
+
+	switch(virtual_video) {
+		case BBB_TDA998X_AUDIO:
+			if (virtual_audio == PINS_TAKEN) {
+				env_set("uboot_video", "/lib/firmware/BB-NHDMI-TDA998x-00A0.dtbo");
+				env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-TDA998x-00A0.dtbo");
+			} else {
+				env_set("uboot_video", "/lib/firmware/BB-HDMI-TDA998x-00A0.dtbo");
+				env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-TDA998x-00A0.dtbo");
+			}
+			break;
+		case BBB_TDA998X_NAUDIO:
+			env_set("uboot_video", "/lib/firmware/BB-NHDMI-TDA998x-00A0.dtbo");
+			env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-TDA998x-00A0.dtbo");
+			break;
+		case BBB_ADV7511_AUDIO:
+			if (virtual_audio == PINS_TAKEN) {
+				env_set("uboot_video", "/lib/firmware/BB-NHDMI-ADV7511-00A0.dtbo");
+				env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-ADV7511-00A0.dtbo");
+			} else {
+				env_set("uboot_video", "/lib/firmware/BB-HDMI-ADV7511-00A0.dtbo");
+				env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-ADV7511-00A0.dtbo");
+			}
+			break;
+		case BBB_ADV7511_NAUDIO:
+			env_set("uboot_video", "/lib/firmware/BB-NHDMI-ADV7511-00A0.dtbo");
+			env_set("uboot_video_naudio", "/lib/firmware/BB-NHDMI-ADV7511-00A0.dtbo");
+			break;
+	}
+
+	switch(virtual_wireless) {
+		case BBBW_WL1835:
+			env_set("uboot_wireless", "/lib/firmware/BB-BBBW-WL1835-00A0.dtbo");
+			break;
+		case BBGW_WL1835:
+			env_set("uboot_wireless", "/lib/firmware/BB-BBGW-WL1835-00A0.dtbo");
+			break;
+		case BBGG_WL1835:
+			env_set("uboot_wireless", "/lib/firmware/BB-BBGG-WL1835-00A0.dtbo");
+			break;
+	}
+
+	switch(virtual_adc) {
+		case BBB_ADC:
+			env_set("uboot_adc", "/lib/firmware/BB-ADC-00A0.dtbo");
+			break;
+	}
+
+	switch(model) {
+		case M_BBG1:
+			env_set("uboot_model", "/lib/firmware/M-BB-BBG-00A0.dtbo");
+			break;
+		case M_OS00:
+			env_set("uboot_model", "/lib/firmware/M-BB-OSD3358-SM-RED-00A0.dtbo");
+			break;
+		case M_BBGG:
+			env_set("uboot_model", "/lib/firmware/M-BB-BBGG-00A0.dtbo");
+			break;
+	}
+
+	switch(cape_universal) {
+		case CAPE_UNIVERSAL_BBB:
+			env_set("uboot_cape_universal_bbb", "1");
+			break;
+		case CAPE_UNIVERSAL_BBG:
+			env_set("uboot_cape_universal_bbg", "1");
+			break;
+		case CAPE_UNIVERSAL_BBGW:
+			env_set("uboot_cape_universal_bbgw", "1");
+			break;
+	}
+
+	i2c_set_bus_num(0);
+	return 0;
+}
+
+void do_cape_detect(void)
+{
+	struct am335x_cape_eeprom_id cape_header;
+
+#ifndef CONFIG_DM_I2C
+	i2c_init(CONFIG_SYS_OMAP24_I2C_SPEED2, CONFIG_SYS_OMAP24_I2C_SLAVE2);
+#endif
+	probe_cape_eeprom(&cape_header);
+}
 
 #ifndef CONFIG_DM_SERIAL
 struct serial_device *default_serial_console(void)
 {
 	if (board_is_icev2())
 		return &eserial4_device;
+	else if (board_is_beaglelogic())
+		return &eserial5_device;
 	else
 		return &eserial1_device;
 }
@@ -266,7 +733,7 @@ const struct dpll_params *get_dpll_ddr_params(void)
 
 	if (board_is_evm_sk())
 		return &dpll_ddr3_303MHz[ind];
-	else if (board_is_pb() || board_is_bone_lt() || board_is_icev2())
+	else if (board_is_pb() || board_is_bone_lt() || board_is_icev2() || board_is_beaglelogic())
 		return &dpll_ddr3_400MHz[ind];
 	else if (board_is_evm_15_or_later())
 		return &dpll_ddr3_303MHz[ind];
@@ -297,7 +764,7 @@ const struct dpll_params *get_dpll_mpu_params(void)
 	if (bone_not_connected_to_ac_power())
 		freq = MPUPLL_M_600;
 
-	if (board_is_pb() || board_is_bone_lt())
+	if (board_is_pb() || board_is_bone_lt() || board_is_beaglelogic())
 		freq = MPUPLL_M_1000;
 
 	switch (freq) {
@@ -349,7 +816,7 @@ static void scale_vcores_bone(int freq)
 	 * Override what we have detected since we know if we have
 	 * a Beaglebone Black it supports 1GHz.
 	 */
-	if (board_is_pb() || board_is_bone_lt())
+	if (board_is_pb() || board_is_bone_lt() || board_is_beaglelogic())
 		freq = MPUPLL_M_1000;
 
 	switch (freq) {
@@ -486,7 +953,11 @@ void scale_vcores(void)
 void set_uart_mux_conf(void)
 {
 #if CONFIG_CONS_INDEX == 1
-	enable_uart0_pin_mux();
+	if (board_is_beaglelogic())
+		enable_uart4_pin_mux();
+	else
+		enable_uart0_pin_mux();
+
 #elif CONFIG_CONS_INDEX == 2
 	enable_uart1_pin_mux();
 #elif CONFIG_CONS_INDEX == 3
@@ -556,7 +1027,7 @@ void sdram_init(void)
 	if (board_is_evm_sk())
 		config_ddr(303, &ioregs_evmsk, &ddr3_data,
 			   &ddr3_cmd_ctrl_data, &ddr3_emif_reg_data, 0);
-	else if (board_is_pb() || board_is_bone_lt())
+	else if (board_is_pb() || board_is_bone_lt() || board_is_beaglelogic())
 		config_ddr(400, &ioregs_bonelt,
 			   &ddr3_beagleblack_data,
 			   &ddr3_beagleblack_cmd_ctrl_data,
@@ -699,11 +1170,60 @@ done:
 }
 #endif
 
+#if defined(CONFIG_SPL_AM33XX_ENABLE_RTC32K_OSC)
+void rtc32k_enable(void)
+{
+	struct davinci_rtc *rtc = (struct davinci_rtc *)RTC_BASE;
+
+	/*
+	 * Unlock the RTC's registers.  For more details please see the
+	 * RTC_SS section of the TRM.  In order to unlock we need to
+	 * write these specific values (keys) in this order.
+	 */
+	writel(RTC_KICK0R_WE, &rtc->kick0r);
+	writel(RTC_KICK1R_WE, &rtc->kick1r);
+
+	if (board_is_pb() || board_is_blue()) {
+		/* 6: EN_32KCLK */
+		/* 3: SEL_32KCLK_SRC 0: internal, 1: external */
+		writel((0 << 3) | (1 << 6), &rtc->osc);
+	} else {
+		/* Enable the RTC 32K OSC by setting bits 3 and 6. */
+		writel((1 << 3) | (1 << 6), &rtc->osc);
+	}
+}
+#endif
+
 /*
  * Basic board specific setup.  Pinmux has been handled already.
  */
 int board_init(void)
 {
+	u32 sys_reboot, sys_rtc_osc;
+
+	sys_reboot = readl(PRM_RSTST);
+	if (sys_reboot & (1 << 9))
+		puts("Reset Source: IcePick reset has occurred.\n");
+
+	if (sys_reboot & (1 << 5))
+		puts("Reset Source: Global external warm reset has occurred.\n");
+
+	if (sys_reboot & (1 << 4))
+		puts("Reset Source: watchdog reset has occurred.\n");
+
+	if (sys_reboot & (1 << 1))
+		puts("Reset Source: Global warm SW reset has occurred.\n");
+
+	if (sys_reboot & (1 << 0))
+		puts("Reset Source: Power-on reset has occurred.\n");
+
+	sys_rtc_osc = readl(RTC_OSC);
+	if (sys_rtc_osc & (1 << 3)) {
+		puts("RTC 32KCLK Source: External.\n");
+	} else {
+		puts("RTC 32KCLK Source: Internal.\n");
+	}
+
 #if defined(CONFIG_HW_WATCHDOG)
 	hw_watchdog_init();
 #endif
@@ -800,6 +1320,8 @@ int board_late_init(void)
 	char *name = NULL;
 
 	if (board_is_bone_lt()) {
+		puts("Board: BeagleBone Black\n");
+		name = "A335BNLT";
 		/* BeagleBoard.org BeagleBone Black Wireless: */
 		if (!strncmp(board_ti_get_rev(), "BWA", 3)) {
 			name = "BBBW";
@@ -808,16 +1330,38 @@ int board_late_init(void)
 		if (!strncmp(board_ti_get_rev(), "GW1", 3)) {
 			name = "BBGW";
 		}
+		/* SeeedStudio BeagleBone Green Gateway */
+		if (!strncmp(board_ti_get_rev(), "GG1", 3)) {
+			name = "BBGG";
+		}
 		/* BeagleBoard.org BeagleBone Blue */
 		if (!strncmp(board_ti_get_rev(), "BLA", 3)) {
 			name = "BBBL";
+		}
+		/* Octavo Systems OSD3358-SM-RED */
+		if (!strncmp(board_ti_get_rev(), "OS00", 4)) {
+			puts("Model: Octavo Systems OSD3358-SM-RED\n");
+			name = "OS00";
 		}
 	}
 
 	if (board_is_bbg1())
 		name = "BBG1";
-	if (board_is_bben())
+
+	if (board_is_bben()) {
+		puts("Model: SanCloud BeagleBone Enhanced\n");
 		name = "BBEN";
+		//Was: name = "SBBE";
+	}
+
+	if (board_is_pb()) {
+		puts("Model: BeagleBoard.org PocketBeagle\n");
+	}
+
+	if (board_is_beaglelogic()) {
+		puts("Model: BeagleLogic\n");
+	}
+
 	set_board_info_env(name);
 
 	/*
@@ -870,6 +1414,14 @@ int board_late_init(void)
 		else
 			env_set("serial#", board_serial);
 	}
+
+#ifdef CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG
+#ifdef CONFIG_TI_I2C_BOARD_DETECT
+	if (!board_is_pb() && !board_is_beaglelogic()) {
+		do_cape_detect();
+	}
+#endif
+#endif
 
 	return 0;
 }
@@ -963,18 +1515,22 @@ int board_eth_init(bd_t *bis)
 	(defined(CONFIG_SPL_ETH_SUPPORT) && defined(CONFIG_SPL_BUILD))
 
 #ifdef CONFIG_DRIVER_TI_CPSW
-	if (board_is_bone() || board_is_bone_lt() || board_is_bben() ||
-	    board_is_idk()) {
+if (!board_is_pb()) {
+	if (board_is_bone() || (board_is_bone_lt() && !board_is_bben()) ||
+	    board_is_idk() || board_is_beaglelogic()) {
+		puts("eth0: MII MODE\n");
 		writel(MII_MODE_ENABLE, &cdev->miisel);
 		cpsw_slaves[0].phy_if = cpsw_slaves[1].phy_if =
 				PHY_INTERFACE_MODE_MII;
 	} else if (board_is_icev2()) {
+		puts("eth0: icev2: RGMII MODE\n");
 		writel(RMII_MODE_ENABLE | RMII_CHIPCKL_ENABLE, &cdev->miisel);
 		cpsw_slaves[0].phy_if = PHY_INTERFACE_MODE_RMII;
 		cpsw_slaves[1].phy_if = PHY_INTERFACE_MODE_RMII;
 		cpsw_slaves[0].phy_addr = 1;
 		cpsw_slaves[1].phy_addr = 3;
 	} else {
+		puts("eth0: RGMII MODE\n");
 		writel((RGMII_MODE_ENABLE | RGMII_INT_DELAY), &cdev->miisel);
 		cpsw_slaves[0].phy_if = cpsw_slaves[1].phy_if =
 				PHY_INTERFACE_MODE_RGMII;
@@ -985,6 +1541,7 @@ int board_eth_init(bd_t *bis)
 		printf("Error %d registering CPSW switch\n", rv);
 	else
 		n += rv;
+}
 #endif
 
 	/*
@@ -1029,6 +1586,7 @@ int board_eth_init(bd_t *bis)
 #ifdef CONFIG_SPL_LOAD_FIT
 int board_fit_config_name_match(const char *name)
 {
+	//FIME: we currently dont use this, yet...
 	if (board_is_gp_evm() && !strcmp(name, "am335x-evm"))
 		return 0;
 	else if (board_is_bone() && !strcmp(name, "am335x-bone"))
